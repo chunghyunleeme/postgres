@@ -176,9 +176,101 @@ MySQL의 네임드 락(`GET_LOCK()`)에 대응하는 PostgreSQL의 기능은 Adv
 
 ### 5.2.4 메타데이터 락
 
+- DDL과 DML의 충돌을 방지하기 위한 잠금이다. DML 실행 시 자동으로 메타데이터 읽기 잠금을 획득하고, DDL 실행 시 메타데이터 쓰기 잠금을 획득한다. 예를 들어 `SELECT` 실행 중에 `ALTER TABLE`이 들어오면, SELECT가 끝날 때까지 DDL이 대기한다.
+
+#### PostgreSQL과의 비교
+
+PostgreSQL은 별도의 메타데이터 락이 없고, 테이블 수준 잠금으로 동일한 역할을 수행한다.
+
+| | MySQL | PostgreSQL |
+|---|---|---|
+| 메커니즘 | 별도의 메타데이터 락 (MDL) | 테이블 수준 잠금 |
+| DML 시 | MDL 읽기 잠금 자동 획득 | `RowExclusiveLock` 등 획득 |
+| DDL 시 | MDL 쓰기 잠금 획득 (DML과 충돌) | `AccessExclusiveLock` 획득 (다른 모든 잠금과 충돌) |
+| 존재 이유 | MySQL 엔진과 스토리지 엔진이 분리되어 있어 별도 계층 필요 | 단일 잠금 체계에 통합 |
+
+MySQL은 2계층 구조(MySQL 엔진 + 스토리지 엔진) 때문에 메타데이터 보호를 위한 별도 잠금 계층이 필요하지만, PostgreSQL은 테이블 락의 호환성 매트릭스로 같은 효과를 달성한다.
+
 ## 5.3 InnoDB 스토리지 엔진 잠금
 
+- InnoDB는 MySQL 엔진의 잠금과는 별개로 스토리지 엔진 내부에서 레코드 기반의 잠금을 탑재하고 있어 MyISAM보다 뛰어난 동시성 처리를 제공한다. 하지만 이원화된 잠금 처리 탓에 잠금 정보에 접근하기가 까다로웠다.
+- 예전: `innodb_lock_monitor` 테이블 생성으로 잠금 정보를 덤프하거나 `SHOW ENGINE INNODB STATUS` 정도만 가능 (가독성 매우 낮음)
+- 이후: `information_schema`의 `INNODB_TRX`, `INNODB_LOCKS`, `INNODB_LOCK_WAITS` 테이블을 조인하여 트랜잭션의 잠금 대기 상태 조회 가능
+- 최근: `performance_schema`로 InnoDB 내부 잠금(세마포어)까지 모니터링 가능
+
+#### PostgreSQL과의 비교
+
+PostgreSQL은 단일 잠금 체계이므로 처음부터 통합된 모니터링을 제공한다.
+
+| 용도 | MySQL | PostgreSQL |
+|---|---|---|
+| 현재 잠금 조회 | `INNODB_LOCKS` / `performance_schema` | `pg_locks` 뷰 |
+| 잠금 대기 조회 | `INNODB_LOCK_WAITS` | `pg_locks`에서 `granted = false` 조회 |
+| 커넥션/트랜잭션 조회 | `SHOW PROCESSLIST` (커넥션) + `INNODB_TRX` (트랜잭션) 분리 | `pg_stat_activity` 뷰 하나에 통합 |
+| 블로킹 세션 찾기 | 여러 테이블 조인 필요 | `pg_blocking_pids()` 함수 |
+
+MySQL은 2계층 구조 때문에 잠금 정보가 분산되어 있어 모니터링이 복잡했지만, PostgreSQL은 단일 체계라 `pg_locks`와 `pg_stat_activity` 정도로 대부분 파악 가능하다. `pg_locks`는 `pg_catalog` 스키마에 있는 내장 시스템 뷰로, 별도 설치 없이 사용 가능하며, 조회 시점에 서버 메모리에서 실시간 잠금 정보를 가져오는 가상 테이블이다. `pg_stat_activity`는 커넥션(세션) 단위로 정보를 보여주는 뷰이지만, 각 커넥션의 트랜잭션 상태(`state`, `xact_start`, `query`, `query_start` 등)도 함께 포함하고 있어 트랜잭션 모니터링에도 사용된다. MySQL에서는 커넥션 조회(`SHOW PROCESSLIST`)와 트랜잭션 조회(`INNODB_TRX`)가 분리되어 있지만, PostgreSQL은 `pg_stat_activity` 하나에 통합되어 있다.
+
 ### 5.3.1 InnoDB 스토리지 엔진의 잠금
+
+- **레코드 락**: 인덱스 레코드 자체에 거는 잠금
+- **갭 락**: 레코드와 레코드 사이의 간격에 거는 잠금 (아직 존재하지 않는 레코드가 삽입되는 것을 방지)
+- **넥스트 키 락**: 레코드 락 + 갭 락의 결합
+- **락 에스컬레이션 없음**: 다른 DBMS(예: SQL Server)에서는 잠금 수가 임계치를 넘으면 메모리 절약을 위해 더 큰 단위(페이지 → 테이블)로 합치는 락 에스컬레이션이 발생하여 동시성이 떨어진다. InnoDB는 잠금 정보 하나가 차지하는 공간이 매우 작아서 레코드가 아무리 많아도 항상 레코드 단위 잠금을 유지한다.
+
+#### PostgreSQL과의 비교
+
+| | InnoDB | PostgreSQL |
+|---|---|---|
+| 레코드 락 | 인덱스 레코드에 잠금 | 행(tuple) 헤더의 `xmax`로 처리 |
+| 갭 락 | 있음 (레코드 사이 간격 잠금) | 없음 |
+| 넥스트 키 락 | 있음 (레코드 + 갭) | 없음 |
+| 락 에스컬레이션 | 없음 (잠금 정보가 작음) | 없음 (`xmax` 방식이라 별도 메모리 불필요) |
+
+갭 락이 해결하는 문제는 팬텀 리드(Phantom Read)이다. InnoDB와 PostgreSQL은 이를 다른 방식으로 처리한다.
+
+```sql
+-- InnoDB (REPEATABLE READ): 삽입 자체를 차단 (비관적 방식)
+-- 세션 A
+SELECT * FROM tab WHERE age BETWEEN 20 AND 30;  -- 3건, age 20~30 사이에 갭 락 설정
+-- 세션 B
+INSERT INTO tab (age) VALUES (25);  -- 갭 락에 걸려서 대기, 삽입 불가
+
+-- PostgreSQL (REPEATABLE READ): 삽입은 허용하되 안 보이게 함 (낙관적 방식)
+-- 세션 A
+SELECT * FROM tab WHERE age BETWEEN 20 AND 30;  -- 3건
+-- 세션 B
+INSERT INTO tab (age) VALUES (25);  -- 갭 락이 없으므로 바로 삽입 성공
+-- 세션 A
+SELECT * FROM tab WHERE age BETWEEN 20 AND 30;  -- 여전히 3건 (MVCC 스냅샷이므로 안 보임)
+```
+
+PostgreSQL은 갭 락 없이도 MVCC 스냅샷으로 팬텀 리드를 방지한다. SERIALIZABLE 격리 수준에서는 갭 락 대신 SSI(Serializable Snapshot Isolation)를 사용하여 충돌이 감지되면 트랜잭션을 롤백시킨다.
+
+갭 락이 없는 PostgreSQL에서 범위 충돌을 방지하는 방법 (예: 같은 시간대 미팅 예약 방지):
+
+1. **EXCLUDE 제약 조건** (권장): 스키마에 명시적으로 "겹침 불가"를 선언하는 방식. btree_gist 확장이 필요하다.
+   ```sql
+   ALTER TABLE meetings
+   ADD CONSTRAINT no_overlap
+   EXCLUDE USING gist (tsrange(start_time, end_time) WITH &&);
+   ```
+2. **Advisory Lock**: 특정 리소스(예: 회의실)에 대해 직렬화하여 처리.
+   ```sql
+   BEGIN;
+   SELECT pg_advisory_xact_lock(hashtext('meeting_room_1'));
+   SELECT * FROM meetings WHERE start_time BETWEEN '09:00' AND '10:00';
+   INSERT INTO meetings ...;
+   COMMIT;
+   ```
+3. **SERIALIZABLE 격리 수준**: 충돌 감지 시 serialization failure가 발생하며, 애플리케이션에서 재시도 로직이 필요하다.
+
+| 방식 | 장점 | 단점 |
+|---|---|---|
+| InnoDB 갭 락 | 자동으로 동작 | 동시성 저하 (대기 발생) |
+| PostgreSQL EXCLUDE 제약 | 선언적, DB가 보장 | btree_gist 확장 필요 |
+| Advisory Lock | 간단, 유연 | 애플리케이션이 규칙을 지켜야 함 |
+| SERIALIZABLE | 표준적 | 충돌 시 재시도 로직 필요 |
 
 ### 5.3.2 인덱스와 잠금
 
