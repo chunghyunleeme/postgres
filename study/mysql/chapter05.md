@@ -695,6 +695,60 @@ UPDATE users SET grade = 'A' WHERE name = 'kim';
 
 **PostgreSQL**: 풀스캔하지만 읽기는 MVCC로 처리하므로 락 안 검. `name = 'kim'`인 행을 발견했을 때만 그 행의 `xmax`에 락 표시. 다른 행은 락 없음 → 다른 트랜잭션 자유롭게 동작.
 
+| | InnoDB | PostgreSQL |
+|---|---|---|
+| 풀스캔 여부 | O | O |
+| 락이 걸리는 행 | 방문한 전부 | 매칭된 것만 |
+| 원칙 | 방문 = 잠금 | 매칭 = 잠금 |
+
+핵심은 PostgreSQL의 풀스캔이 **MVCC 스냅샷 읽기**라는 점이다. 행의 `xmin`/`xmax`를 보고 "이 트랜잭션에서 보이는 버전인지" 판단만 할 뿐, 락 정보를 쓰지 않는다. 락은 매칭된 행에 도달했을 때만 `xmax`에 새겨진다.
+
+###### 다른 트랜잭션이 락을 걸려고 할 때의 동작
+
+위 UPDATE 실행 중에 다른 트랜잭션이 어떻게 영향을 받는지 시나리오별로 본다 (트랜잭션 A: `UPDATE ... WHERE name = 'kim'` 실행 중, kim 행 3개가 잠긴 상태).
+
+**시나리오 1**: 다른 행에 락을 걸려는 경우
+
+```sql
+-- 트랜잭션 B
+UPDATE users SET grade = 'B' WHERE name = 'park';
+-- → park 행에는 락 없음 → 즉시 진행 (InnoDB라면 대기)
+
+SELECT * FROM users WHERE name = 'lee' FOR UPDATE;
+-- → lee 행에도 락 없음 → 즉시 락 획득 (InnoDB라면 대기)
+```
+
+**시나리오 2**: 같은 행에 락을 걸려는 경우
+
+```sql
+-- 트랜잭션 B
+UPDATE users SET email = 'x' WHERE name = 'kim';
+-- → kim 행의 xmax를 보니 A가 잠금 중 → 대기 (A가 commit/rollback까지)
+
+SELECT * FROM users WHERE name = 'kim' FOR UPDATE;
+-- → 동일하게 대기
+```
+
+매칭된 행이 겹치면 PostgreSQL도 당연히 대기한다. 락은 락이니까.
+
+**시나리오 3**: 단순 SELECT (락 없음)
+
+```sql
+-- 트랜잭션 B
+SELECT * FROM users WHERE name = 'kim';
+-- → MVCC로 A 커밋 전 버전(이전 grade)을 읽음 → 안 막힘
+```
+
+쓰기 락이 읽기를 막지 않는다. MVCC의 핵심 효과다.
+
+| 시나리오 | InnoDB | PostgreSQL |
+|---|---|---|
+| 다른 행 UPDATE / FOR UPDATE | 대기 | 즉시 진행 |
+| 같은 행 UPDATE / FOR UPDATE | 대기 | 대기 (동일) |
+| 단순 SELECT | 안 막힘 (MVCC) | 안 막힘 (MVCC) |
+
+PostgreSQL의 동시성 영향은 **매칭된 행에만 국소적으로 발생**한다. 매칭 안 된 행을 건드리는 다른 트랜잭션은 영향받지 않는다.
+
 ###### 동시성 ≠ 성능
 
 여기서 핵심은 **동시성과 성능은 다른 문제**라는 것이다.
