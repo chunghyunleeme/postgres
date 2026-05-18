@@ -782,6 +782,143 @@ PostgreSQL에서 인덱스 없는 UPDATE는 **성능은 나쁘지만 동시성�
 
 ### 5.3.3 레코드 수준의 잠금 확인 및 해제
 
+InnoDB의 락은 **트랜잭션이 끝나야** 풀린다(`COMMIT`/`ROLLBACK`). 락을 직접 해제하는 명령은 없으며, 대기에 빠진 상황을 강제로 풀려면 락을 잡고 있는 스레드를 KILL해야 한다.
+
+##### performance_schema.data_locks
+
+지금 InnoDB가 보유한 모든 락을 행 단위로 보여준다 (한 락당 한 행).
+
+```sql
+SELECT thread_id, object_name, index_name, lock_type, lock_mode,
+       lock_status, lock_data
+FROM performance_schema.data_locks;
+```
+
+주요 컬럼:
+
+| 컬럼 | 의미 |
+|---|---|
+| `ENGINE_TRANSACTION_ID` | 락을 잡은 InnoDB 트랜잭션 ID |
+| `THREAD_ID` | 락을 잡은 스레드(커넥션) |
+| `OBJECT_SCHEMA`, `OBJECT_NAME` | DB.테이블 |
+| `INDEX_NAME` | **어느 인덱스에 락이 걸렸는지** (InnoDB가 인덱스 단위로 락을 거는 점이 드러난다) |
+| `LOCK_TYPE` | `TABLE` 또는 `RECORD` |
+| `LOCK_MODE` | `S`, `X`, `S,GAP`, `X,GAP`, `IS`, `IX`, `S,REC_NOT_GAP`, `X,REC_NOT_GAP`, `X,INSERT_INTENTION` 등 |
+| `LOCK_STATUS` | `GRANTED`(획득) 또는 `WAITING`(대기 중) |
+| `LOCK_DATA` | 잠긴 인덱스 키 값 |
+
+`LOCK_MODE`의 접미사가 핵심이다:
+- `REC_NOT_GAP`: 순수 레코드 락
+- `GAP`: 순수 갭 락
+- (접미사 없음): 넥스트 키 락 (레코드 + 갭)
+- `INSERT_INTENTION`: 인서트 인텐션 락 (INSERT가 갭에 들어가려고 대기 중)
+
+##### performance_schema.data_lock_waits
+
+락 대기 관계를 **블로커 → 블로키** 짝으로 보여준다.
+
+```sql
+SELECT r.thread_id AS waiting_thread,
+       r.lock_mode AS waiting_mode,
+       b.thread_id AS blocking_thread,
+       b.lock_mode AS blocking_mode,
+       r.object_name, r.index_name, r.lock_data
+FROM performance_schema.data_lock_waits w
+JOIN performance_schema.data_locks r ON w.requesting_engine_lock_id = r.engine_lock_id
+JOIN performance_schema.data_locks b ON w.blocking_engine_lock_id  = b.engine_lock_id;
+```
+
+`data_locks`만으로도 `LOCK_STATUS = 'WAITING'`인 행은 알 수 있지만, **누가 막고 있는지**는 `data_lock_waits`로 조인해야 알 수 있다.
+
+##### 실전 진단 쿼리
+
+```sql
+-- 누가 누구를 막고 있는지 한눈에
+SELECT
+  b.trx_id              AS blocker_trx,
+  b.trx_mysql_thread_id AS blocker_thread,   -- KILL 대상
+  b.trx_query           AS blocker_query,
+  w.trx_id              AS waiter_trx,
+  w.trx_mysql_thread_id AS waiter_thread,
+  w.trx_query           AS waiter_query,
+  dl.object_name, dl.index_name, dl.lock_mode, dl.lock_data,
+  TIMESTAMPDIFF(SECOND, b.trx_started, NOW()) AS blocker_age_sec
+FROM performance_schema.data_lock_waits dlw
+JOIN performance_schema.data_locks dl
+     ON dl.engine_lock_id = dlw.blocking_engine_lock_id
+JOIN information_schema.innodb_trx b
+     ON b.trx_id = dlw.blocking_engine_transaction_id
+JOIN information_schema.innodb_trx w
+     ON w.trx_id = dlw.requesting_engine_transaction_id;
+```
+
+##### KILL: 스레드/쿼리 강제 종료
+
+```sql
+KILL <thread_id>;          -- 커넥션 종료. 진행 중 트랜잭션 롤백 → 락 해제
+KILL QUERY <thread_id>;    -- 현재 쿼리만 중단. 커넥션과 트랜잭션은 유지
+```
+
+| | `KILL` | `KILL QUERY` |
+|---|---|---|
+| 대상 | 스레드(커넥션) | 현재 실행 중인 쿼리만 |
+| 트랜잭션 | 롤백 | 유지 (다음 쿼리 실행 가능) |
+| 락 해제 | 됨 (트랜잭션 종료) | **안 됨** (트랜잭션 살아있음) |
+| 용도 | 막힌 트랜잭션 자체 종료 | 폭주하는 단일 쿼리만 중단 |
+
+**잠금을 풀려면 항상 `KILL`** — `KILL QUERY`는 트랜잭션이 살아있어 락이 풀리지 않는다.
+
+권한:
+- 자기 스레드: 권한 불필요
+- 다른 사용자의 스레드:
+  - 보기: `PROCESS` 권한
+  - KILL: `CONNECTION_ADMIN` (MySQL 8.0+, 이전엔 `SUPER`)
+
+##### 자동 해제 메커니즘
+
+수동 KILL이 필요 없는 두 가지 자동 동작:
+
+1. **`innodb_lock_wait_timeout`** (기본 50초): 락 대기가 이 값을 넘으면 대기 트랜잭션이 자동 에러(`Lock wait timeout exceeded`). 해당 쿼리만 롤백되지 트랜잭션 전체는 아니므로, 애플리케이션이 `ROLLBACK`을 호출해 깔끔히 종료해야 한다.
+2. **데드락 감지**: 데드락 발견 시 InnoDB가 둘 중 한 트랜잭션을 자동 롤백(`Deadlock found ...`). `innodb_deadlock_detect = ON`이 기본값.
+
+##### PostgreSQL과의 비교
+
+| | InnoDB | PostgreSQL |
+|---|---|---|
+| 현재 락 보기 | `performance_schema.data_locks` | `pg_locks` |
+| 대기 관계 보기 | `performance_schema.data_lock_waits` | `pg_blocking_pids(pid)`, 또는 `pg_locks` self-join |
+| 락이 어느 인덱스에 걸렸는지 | `INDEX_NAME` 컬럼에 노출 | 없음 (락이 행에 걸리므로) |
+| 갭 락 표시 | `LOCK_MODE`의 `GAP`/`X,GAP` 등 | 없음 (갭 락 자체가 없음) |
+| 트랜잭션/쿼리 결합 | `information_schema.innodb_trx`와 조인 | `pg_stat_activity`와 조인 |
+| 쿼리만 취소 | `KILL QUERY <thread_id>` | `pg_cancel_backend(pid)` |
+| 커넥션 종료 (락 해제) | `KILL <thread_id>` | `pg_terminate_backend(pid)` |
+| 락 대기 타임아웃 | `innodb_lock_wait_timeout` (기본 50s, 글로벌/세션) | `lock_timeout` (기본 0=무한, **문장 단위 설정 가능**) |
+| 데드락 감지 | 자동, 즉시 | 자동, `deadlock_timeout` (기본 1s) 후 |
+| 권한 | `CONNECTION_ADMIN` / `SUPER` | superuser 또는 `pg_signal_backend` 역할 |
+
+PostgreSQL 사용 예:
+
+```sql
+-- 막힌 PID 찾기
+SELECT pid, query, pg_blocking_pids(pid)
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+
+-- 블로커가 PID 12345라면
+SELECT pg_cancel_backend(12345);    -- 쿼리만 취소 (KILL QUERY 대응)
+SELECT pg_terminate_backend(12345); -- 커넥션 종료 (KILL 대응)
+```
+
+흥미로운 차이는 PostgreSQL의 `lock_timeout`을 **문장 단위로 설정**할 수 있다는 점이다.
+
+```sql
+SET LOCAL lock_timeout = '3s';
+UPDATE users SET grade = 'A' WHERE id = 1;
+-- 3초 안에 락을 못 잡으면 에러
+```
+
+InnoDB는 `innodb_lock_wait_timeout`을 세션 단위로 변경할 수 있지만, PostgreSQL처럼 특정 쿼리만 짧은 타임아웃을 거는 식의 세밀한 제어는 어렵다.
+
 ## 5.4 MySQL의 격리 수준
 
 ### 5.4.1 READ UNCOMMITTED
